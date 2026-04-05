@@ -366,60 +366,7 @@ function M.find_files()
 end
 
 function M.live_grep()
-	local opts = config.get()
-	local root = vim.fn.getcwd()
-
-	vim.ui.input({ prompt = "Grep> " }, function(input)
-		if not input or input == "" then
-			return
-		end
-
-		local cmd = {
-			opts.binary,
-			"grep",
-			"--root",
-			root,
-			"--query",
-			input,
-			"--limit",
-			tostring(opts.limit * 4),
-			"--cache-ttl",
-			tostring(opts.cache_ttl or 30),
-			"--json",
-		}
-
-		if not opts.use_cache then
-			table.insert(cmd, "--no-cache")
-		end
-		if opts.rebuild_cache then
-			table.insert(cmd, "--rebuild-cache")
-		end
-
-		local stdout, err = run_system(cmd)
-		if not stdout then
-			vim.notify("smart-fuzzy-finder: " .. (err or "grep failed"), vim.log.levels.ERROR)
-			return
-		end
-
-		local ok, matches = pcall(vim.json.decode, stdout)
-		if not ok then
-			vim.notify("smart-fuzzy-finder: failed to parse grep output", vim.log.levels.ERROR)
-			return
-		end
-
-		local qf = {}
-		for _, item in ipairs(matches) do
-			qf[#qf + 1] = {
-				filename = root .. "/" .. item.path,
-				lnum = item.line,
-				col = item.column,
-				text = item.text,
-			}
-		end
-
-		vim.fn.setqflist({}, " ", { title = "smart-fuzzy-finder grep: " .. input, items = qf })
-		vim.cmd.copen()
-	end)
+	M.live_grep_prefilled(nil)
 end
 
 function M.grep_cword()
@@ -431,6 +378,54 @@ function M.grep_cword()
 	M.live_grep_prefilled(word)
 end
 
+local function run_grep_with_query(query, opts, root)
+	local cmd = {
+		opts.binary,
+		"grep",
+		"--root",
+		root,
+		"--query",
+		query,
+		"--limit",
+		tostring(opts.limit * 4),
+		"--cache-ttl",
+		tostring(opts.cache_ttl or 30),
+		"--json",
+	}
+
+	if not opts.use_cache then
+		table.insert(cmd, "--no-cache")
+	end
+	if opts.rebuild_cache then
+		table.insert(cmd, "--rebuild-cache")
+	end
+
+	local stdout, err = run_system(cmd)
+	if not stdout then
+		vim.notify("smart-fuzzy-finder: " .. (err or "grep failed"), vim.log.levels.ERROR)
+		return
+	end
+
+	local ok, matches = pcall(vim.json.decode, stdout)
+	if not ok then
+		vim.notify("smart-fuzzy-finder: failed to parse grep output", vim.log.levels.ERROR)
+		return
+	end
+
+	local qf = {}
+	for _, item in ipairs(matches) do
+		qf[#qf + 1] = {
+			filename = root .. "/" .. item.path,
+			lnum = item.line,
+			col = item.column,
+			text = item.text,
+		}
+	end
+
+	vim.fn.setqflist({}, " ", { title = "smart-fuzzy-finder grep: " .. query, items = qf })
+	vim.cmd.copen()
+end
+
 function M.live_grep_prefilled(default_text)
 	local opts = config.get()
 	local root = vim.fn.getcwd()
@@ -440,51 +435,7 @@ function M.live_grep_prefilled(default_text)
 			return
 		end
 
-		local cmd = {
-			opts.binary,
-			"grep",
-			"--root",
-			root,
-			"--query",
-			input,
-			"--limit",
-			tostring(opts.limit * 4),
-			"--cache-ttl",
-			tostring(opts.cache_ttl or 30),
-			"--json",
-		}
-
-		if not opts.use_cache then
-			table.insert(cmd, "--no-cache")
-		end
-		if opts.rebuild_cache then
-			table.insert(cmd, "--rebuild-cache")
-		end
-
-		local stdout, err = run_system(cmd)
-		if not stdout then
-			vim.notify("smart-fuzzy-finder: " .. (err or "grep failed"), vim.log.levels.ERROR)
-			return
-		end
-
-		local ok, matches = pcall(vim.json.decode, stdout)
-		if not ok then
-			vim.notify("smart-fuzzy-finder: failed to parse grep output", vim.log.levels.ERROR)
-			return
-		end
-
-		local qf = {}
-		for _, item in ipairs(matches) do
-			qf[#qf + 1] = {
-				filename = root .. "/" .. item.path,
-				lnum = item.line,
-				col = item.column,
-				text = item.text,
-			}
-		end
-
-		vim.fn.setqflist({}, " ", { title = "smart-fuzzy-finder grep: " .. input, items = qf })
-		vim.cmd.copen()
+		run_grep_with_query(input, opts, root)
 	end)
 end
 
