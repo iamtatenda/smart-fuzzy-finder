@@ -63,5 +63,7 @@ pub fn default_history_path() -> PathBuf {
         .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.local/state")))
         .unwrap_or_else(|_| ".".to_string());
 
-    PathBuf::from(root).join("smart-fuzzy-finder").join("history.json")
+    PathBuf::from(root)
+        .join("smart-fuzzy-finder")
+        .join("history.json")
 }

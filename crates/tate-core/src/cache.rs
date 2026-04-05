@@ -32,15 +32,15 @@ struct IndexCachePayload {
 
 const CACHE_VERSION: u32 = 1;
 
-pub fn load_index_cache(
-    root: &Path,
-    include_hidden: bool,
-    ttl_secs: u64,
-) -> Option<Vec<String>> {
+pub fn load_index_cache(root: &Path, include_hidden: bool, ttl_secs: u64) -> Option<Vec<String>> {
     load_index_cache_from_dir(&default_cache_dir(), root, include_hidden, ttl_secs)
 }
 
-pub fn save_index_cache(root: &Path, include_hidden: bool, files: &[String]) -> std::io::Result<()> {
+pub fn save_index_cache(
+    root: &Path,
+    include_hidden: bool,
+    files: &[String],
+) -> std::io::Result<()> {
     save_index_cache_to_dir(&default_cache_dir(), root, include_hidden, files)
 }
 
@@ -105,7 +105,11 @@ fn index_cache_path_in(cache_dir: &Path, root: &Path, include_hidden: bool) -> P
     if key.len() > 120 {
         key.truncate(120);
     }
-    key.push_str(if include_hidden { "_hidden" } else { "_visible" });
+    key.push_str(if include_hidden {
+        "_hidden"
+    } else {
+        "_visible"
+    });
     cache_dir
         .join("smart-fuzzy-finder")
         .join("index")
@@ -156,8 +160,8 @@ mod tests {
         ];
 
         save_index_cache_to_dir(cache_dir.path(), root, false, &files).expect("save cache");
-        let loaded = load_index_cache_from_dir(cache_dir.path(), root, false, 60)
-            .expect("load cache");
+        let loaded =
+            load_index_cache_from_dir(cache_dir.path(), root, false, 60).expect("load cache");
 
         assert_eq!(loaded, files);
     }
