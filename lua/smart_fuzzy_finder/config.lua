@@ -12,6 +12,7 @@ M.defaults = {
 	width = 0.86,
 	height = 0.72,
 	preview_width = 0.50,
+	debounce_ms = 60,
 	keymaps = {
 		find_files = "<leader>ff",
 		live_grep = "<leader>fg",
