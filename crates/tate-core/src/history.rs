@@ -29,7 +29,12 @@ impl HistoryStore {
             fs::create_dir_all(parent)?;
         }
         let payload = serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string());
-        fs::write(path, payload)
+
+        // Write atomically: persist to a sibling .tmp file then rename so that
+        // a crash or SIGKILL mid-write never leaves a truncated history file.
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, payload)?;
+        fs::rename(&tmp_path, path)
     }
 
     pub fn touch_file(&mut self, rel_path: &str) {
