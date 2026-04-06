@@ -19,19 +19,24 @@ const GIT_CACHE_TTL: Duration = Duration::from_secs(2);
 pub fn collect_git_signals(root: &Path) -> GitSignals {
     // Check cache under a short-lived lock.
     {
-        let guard = GIT_SIGNAL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((ref cached_root, ref signals, ref ts)) = *guard {
-            if cached_root == root && ts.elapsed() < GIT_CACHE_TTL {
-                return signals.clone();
+        match GIT_SIGNAL_CACHE.lock() {
+            Ok(guard) => {
+                if let Some((ref cached_root, ref signals, ref ts)) = *guard {
+                    if cached_root == root && ts.elapsed() < GIT_CACHE_TTL {
+                        return signals.clone();
+                    }
+                }
             }
+            // Poisoned mutex means a previous holder panicked.  Fall through
+            // to a fresh git-status call rather than propagating the poison.
+            Err(_) => {}
         }
     }
 
     let signals = run_git_status(root);
 
-    // Store in cache.
-    {
-        let mut guard = GIT_SIGNAL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    // Store in cache; ignore a poisoned mutex here too.
+    if let Ok(mut guard) = GIT_SIGNAL_CACHE.lock() {
         *guard = Some((root.to_path_buf(), signals.clone(), Instant::now()));
     }
 

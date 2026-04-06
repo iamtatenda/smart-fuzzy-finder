@@ -87,6 +87,8 @@ pub fn search(request: &SearchRequest, config: &SearchConfig) -> Vec<MatchResult
     let root_for_git = root.clone();
     let git_handle = std::thread::spawn(move || collect_git_signals(&root_for_git));
     let index = indexed_files(&root, request.include_hidden, &cache_cfg);
+    // A panic inside the git thread would be a programming error; fall back to
+    // empty signals rather than unwinding the caller.
     let git = git_handle.join().unwrap_or_default();
 
     let mut scored = Vec::new();

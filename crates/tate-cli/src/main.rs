@@ -117,7 +117,9 @@ fn run_find(args: FindArgs) -> Result<()> {
         return Ok(());
     }
 
-    let query = args.query.expect("--query is required when --stdin is not set");
+    let query = args
+        .query
+        .context("--query is required when --stdin is not set")?;
     let req = SearchRequest {
         root: root_str,
         query,
