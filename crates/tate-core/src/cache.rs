@@ -1,7 +1,9 @@
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,17 +101,31 @@ fn normalize_root(root: &Path) -> String {
     root.to_string_lossy().replace('\\', "/")
 }
 
-fn index_cache_path_in(cache_dir: &Path, root: &Path, include_hidden: bool) -> PathBuf {
+/// Build a collision-resistant cache file path.
+///
+/// The key is a sanitised prefix of the path (up to 80 chars) followed by an
+/// underscore and 16 hex digits of FxHash of the full path string.  This
+/// prevents collisions between repos whose paths share a long common prefix
+/// while keeping the filename human-readable.
+pub(crate) fn index_cache_path_in(cache_dir: &Path, root: &Path, include_hidden: bool) -> PathBuf {
     let root_component = normalize_root(root);
+
+    let mut hasher = FxHasher::default();
+    root_component.hash(&mut hasher);
+    let hash = hasher.finish();
+
     let mut key = sanitize_key(&root_component);
-    if key.len() > 120 {
-        key.truncate(120);
+    if key.len() > 80 {
+        key.truncate(80);
     }
+    key.push('_');
+    key.push_str(&format!("{hash:016x}"));
     key.push_str(if include_hidden {
         "_hidden"
     } else {
         "_visible"
     });
+
     cache_dir
         .join("smart-fuzzy-finder")
         .join("index")
@@ -142,11 +158,12 @@ fn default_cache_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
     use tempfile::tempdir;
 
-    use super::{load_index_cache_from_dir, save_index_cache_to_dir};
+    use super::{index_cache_path_in, load_index_cache_from_dir, save_index_cache_to_dir};
 
     #[test]
     fn cache_roundtrip_returns_saved_files() {
@@ -176,5 +193,47 @@ mod tests {
         let loaded = load_index_cache_from_dir(cache_dir.path(), root, true, 60);
 
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn cache_rejects_expired_ttl() {
+        let cache_dir = tempdir().expect("temp cache dir");
+        let root_dir = tempdir().expect("temp root dir");
+        let root = root_dir.path();
+
+        let files = vec!["src/main.rs".to_string()];
+        save_index_cache_to_dir(cache_dir.path(), root, false, &files).expect("save cache");
+
+        // Overwrite created_unix with Unix epoch (way in the past).
+        let cache_path = index_cache_path_in(cache_dir.path(), root, false);
+        let content = fs::read_to_string(&cache_path).expect("read cache file");
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&content).expect("parse cache JSON");
+        payload["created_unix"] = serde_json::json!(0);
+        fs::write(&cache_path, serde_json::to_string(&payload).unwrap())
+            .expect("write modified cache");
+
+        // TTL of 60 s but the file is from the epoch — must be rejected.
+        let loaded = load_index_cache_from_dir(cache_dir.path(), root, false, 60);
+        assert!(loaded.is_none(), "expired cache entry must be rejected");
+    }
+
+    #[test]
+    fn cache_key_differs_for_long_shared_prefix() {
+        // Two paths that share the first 80+ characters must get different keys.
+        let prefix = "a".repeat(100);
+        let path_a = format!("{prefix}/projectA");
+        let path_b = format!("{prefix}/projectB");
+        let root_a = Path::new(&path_a);
+        let root_b = Path::new(&path_b);
+
+        let cache_dir = tempdir().expect("temp cache dir");
+        let key_a = index_cache_path_in(cache_dir.path(), root_a, false);
+        let key_b = index_cache_path_in(cache_dir.path(), root_b, false);
+
+        assert_ne!(
+            key_a, key_b,
+            "different root paths must produce different cache keys"
+        );
     }
 }

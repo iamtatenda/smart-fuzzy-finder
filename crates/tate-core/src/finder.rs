@@ -1,10 +1,10 @@
 use std::fs::File;
-use std::io::Read;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use ignore::{WalkBuilder, WalkState};
+use rayon::prelude::*;
 
 use crate::cache::{load_index_cache, save_index_cache, CacheConfig};
 use crate::git::collect_git_signals;
@@ -76,13 +76,20 @@ pub fn search(request: &SearchRequest, config: &SearchConfig) -> Vec<MatchResult
     }
 
     let history = HistoryStore::load(&default_history_path());
-    let git = collect_git_signals(&root);
     let cache_cfg = CacheConfig {
         use_cache: request.use_cache,
         ttl_secs: request.cache_ttl_secs,
         rebuild: request.rebuild_cache,
     };
+
+    // Build the file index and collect git signals concurrently so the
+    // `git status` subprocess doesn't sit on the critical path.
+    let root_for_git = root.clone();
+    let git_handle = std::thread::spawn(move || collect_git_signals(&root_for_git));
     let index = indexed_files(&root, request.include_hidden, &cache_cfg);
+    // A panic inside the git thread would be a programming error; fall back to
+    // empty signals rather than unwinding the caller.
+    let git = git_handle.join().unwrap_or_default();
 
     let mut scored = Vec::new();
     for rel_path in index {
@@ -148,40 +155,52 @@ pub fn grep_project(
         return Vec::new();
     }
 
+    let files = indexed_files(root, include_hidden, cache);
+
+    // Scan files in parallel; each file is opened once — the first 4 KB are
+    // used for binary detection and then replayed through BufReader so no
+    // byte is read twice.
+    let mut results: Vec<GrepResult> = files
+        .par_iter()
+        .flat_map(|rel_path| grep_file(&root.join(rel_path), rel_path, needle))
+        .collect();
+
+    results.truncate(limit);
+    results
+}
+
+/// Open `abs` once, detect binary, then scan lines — all from a single
+/// file descriptor using a chained reader.
+fn grep_file(abs: &Path, rel_path: &str, needle: &str) -> Vec<GrepResult> {
+    let Ok(mut file) = File::open(abs) else {
+        return Vec::new();
+    };
+
+    let mut header = [0u8; 4096];
+    let Ok(n) = file.read(&mut header) else {
+        return Vec::new();
+    };
+
+    if header[..n].contains(&0) {
+        return Vec::new(); // binary file
+    }
+
+    // Replay the already-read bytes through a Cursor, then chain with the
+    // rest of the file so the BufReader sees the complete content.
+    let reader = BufReader::new(io::Cursor::new(header[..n].to_vec()).chain(file));
     let mut results = Vec::new();
-    for rel_path in indexed_files(root, include_hidden, cache) {
-        if results.len() >= limit {
-            break;
-        }
 
-        let abs = root.join(&rel_path);
-        if is_probably_binary_file(&abs) {
+    for (line_idx, line) in reader.lines().enumerate() {
+        let Ok(text) = line else {
             continue;
-        }
-
-        let file = match File::open(&abs) {
-            Ok(file) => file,
-            Err(_) => continue,
         };
-
-        let reader = BufReader::new(file);
-        for (line_idx, line) in reader.lines().enumerate() {
-            if results.len() >= limit {
-                break;
-            }
-
-            let Ok(text) = line else {
-                continue;
-            };
-
-            if let Some(col) = fuzzy_line_match(&text, needle) {
-                results.push(GrepResult {
-                    path: rel_path.clone(),
-                    line: line_idx + 1,
-                    column: col + 1,
-                    text,
-                });
-            }
+        if let Some(col) = fuzzy_line_match(&text, needle) {
+            results.push(GrepResult {
+                path: rel_path.to_string(),
+                line: line_idx + 1,
+                column: col + 1,
+                text,
+            });
         }
     }
 
@@ -200,19 +219,6 @@ fn indexed_files(root: &Path, include_hidden: bool, cache: &CacheConfig) -> Vec<
         let _ = save_index_cache(root, include_hidden, &files);
     }
     files
-}
-
-fn is_probably_binary_file(path: &Path) -> bool {
-    let Ok(mut file) = File::open(path) else {
-        return false;
-    };
-
-    let mut buf = [0u8; 4096];
-    let Ok(n) = file.read(&mut buf) else {
-        return false;
-    };
-
-    buf[..n].contains(&0)
 }
 
 fn fuzzy_line_match(line: &str, query: &str) -> Option<usize> {
@@ -270,9 +276,78 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<(f64, Vec<usize>, f64)> {
     }
 
     let c = candidate.to_ascii_lowercase();
+
+    // Fast path: avoid Vec<char> allocation for pure-ASCII inputs, which is
+    // the common case for file paths.  Char indices equal byte indices for
+    // ASCII, so we can work directly with byte slices.
+    if q.is_ascii() && c.is_ascii() {
+        return fuzzy_score_ascii(q.as_bytes(), candidate, c.as_bytes());
+    }
+
+    // Unicode fallback: collect chars for correct grapheme indexing.
     let q_chars: Vec<char> = q.chars().collect();
     let c_chars: Vec<char> = c.chars().collect();
+    fuzzy_score_unicode(&q, candidate, &q_chars, &c_chars)
+}
 
+fn fuzzy_score_ascii(q: &[u8], candidate: &str, c: &[u8]) -> Option<(f64, Vec<usize>, f64)> {
+    let mut positions = Vec::with_capacity(q.len());
+    let mut q_i = 0usize;
+    let mut last_match: Option<usize> = None;
+    let mut streak = 0usize;
+    let mut score = 0.0f64;
+
+    for (idx, &ch) in c.iter().enumerate() {
+        if q_i >= q.len() {
+            break;
+        }
+        if ch != q[q_i] {
+            continue;
+        }
+
+        positions.push(idx);
+        score += 1.0;
+
+        let prev = idx.checked_sub(1).and_then(|i| c.get(i)).copied();
+        if idx == 0 || matches!(prev, Some(b'/' | b'_' | b'-')) {
+            score += 0.35;
+        }
+
+        if let Some(prev_idx) = last_match {
+            if idx == prev_idx + 1 {
+                streak += 1;
+                score += 0.30 + (streak as f64 * 0.05);
+            } else {
+                streak = 0;
+            }
+        }
+
+        last_match = Some(idx);
+        q_i += 1;
+    }
+
+    if q_i != q.len() {
+        return None;
+    }
+
+    let compactness = q.len() as f64 / (c.len().max(1) as f64);
+    score += compactness * 1.2;
+
+    let file_name = candidate.rsplit('/').next().unwrap_or(candidate);
+    // SAFETY: q was obtained from an ASCII-checked str.
+    let q_str = std::str::from_utf8(q).unwrap_or("");
+    let d = normalized_levenshtein(q_str, &file_name.to_ascii_lowercase());
+    let typo_bonus = if d <= 0.45 { (0.45 - d).max(0.0) } else { 0.0 };
+
+    Some((score, positions, typo_bonus))
+}
+
+fn fuzzy_score_unicode(
+    q: &str,
+    candidate: &str,
+    q_chars: &[char],
+    c_chars: &[char],
+) -> Option<(f64, Vec<usize>, f64)> {
     let mut positions = Vec::with_capacity(q_chars.len());
     let mut q_i = 0usize;
     let mut last_match = None;
@@ -283,7 +358,6 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<(f64, Vec<usize>, f64)> {
         if q_i >= q_chars.len() {
             break;
         }
-
         if ch != q_chars[q_i] {
             continue;
         }
@@ -316,12 +390,9 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<(f64, Vec<usize>, f64)> {
     let compactness = q_chars.len() as f64 / (c_chars.len().max(1) as f64);
     score += compactness * 1.2;
 
-    let mut typo_bonus = 0.0;
     let file_name = candidate.rsplit('/').next().unwrap_or(candidate);
-    let d = normalized_levenshtein(&q, &file_name.to_ascii_lowercase());
-    if d <= 0.45 {
-        typo_bonus = (0.45 - d).max(0.0);
-    }
+    let d = normalized_levenshtein(q, &file_name.to_ascii_lowercase());
+    let typo_bonus = if d <= 0.45 { (0.45 - d).max(0.0) } else { 0.0 };
 
     Some((score, positions, typo_bonus))
 }
@@ -369,7 +440,7 @@ mod tests {
     use crate::cache::CacheConfig;
     use crate::types::{SearchConfig, SearchRequest};
 
-    use super::{build_index, extension_score, fuzzy_score, grep_project, search};
+    use super::{build_index, extension_score, fuzzy_line_match, fuzzy_score, grep_project, search};
 
     #[test]
     fn search_handles_typo_query() {
@@ -501,5 +572,33 @@ mod tests {
 
         let results = search(&request, &SearchConfig::default());
         assert!(results.is_empty(), "empty query should return no results");
+    }
+
+    #[test]
+    fn fuzzy_line_match_exact_substring() {
+        let col = fuzzy_line_match("hello world", "world");
+        assert_eq!(col, Some(6), "exact substring must match at correct column");
+    }
+
+    #[test]
+    fn fuzzy_line_match_case_insensitive() {
+        let col = fuzzy_line_match("Hello World", "world");
+        assert!(col.is_some(), "match must be case-insensitive");
+    }
+
+    #[test]
+    fn fuzzy_line_match_tolerates_single_typo() {
+        // "nedle" is one edit away from "needle"
+        let col = fuzzy_line_match("hello needle world", "nedle");
+        assert!(
+            col.is_some(),
+            "single-character deletion typo should still match"
+        );
+    }
+
+    #[test]
+    fn fuzzy_line_match_no_match_for_unrelated_query() {
+        let col = fuzzy_line_match("hello world", "zzzzz");
+        assert!(col.is_none(), "completely unrelated query should not match");
     }
 }

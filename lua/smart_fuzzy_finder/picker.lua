@@ -2,22 +2,6 @@ local config = require("smart_fuzzy_finder.config")
 
 local M = {}
 
-local function run_system(cmd)
-	if vim.system then
-		local out = vim.system(cmd, { text = true }):wait()
-		if out.code ~= 0 then
-			return nil, (out.stderr or "command failed")
-		end
-		return out.stdout, nil
-	end
-
-	local output = vim.fn.system(cmd)
-	if vim.v.shell_error ~= 0 then
-		return nil, output
-	end
-	return output, nil
-end
-
 local function calc_layout(opts)
 	local columns = vim.o.columns
 	local lines = vim.o.lines - vim.o.cmdheight
@@ -73,6 +57,13 @@ local function load_preview(preview_buf, root, relpath)
 
 	if ok and #lines > 0 then
 		vim.api.nvim_buf_set_lines(preview_buf, 0, -1, false, lines)
+		-- Enable syntax highlighting in the preview pane.
+		pcall(function()
+			local ft = vim.filetype.match({ buf = preview_buf, filename = relpath })
+			if ft then
+				vim.bo[preview_buf].filetype = ft
+			end
+		end)
 	else
 		vim.api.nvim_buf_set_lines(preview_buf, 0, -1, false, { "Unable to preview: " .. relpath })
 	end
@@ -80,6 +71,9 @@ local function load_preview(preview_buf, root, relpath)
 	vim.bo[preview_buf].modifiable = false
 end
 
+--- Start an async file-find and call on_done(results, err) when complete.
+--- Returns a handle table with a single `kill()` function regardless of which
+--- backend (vim.system or jobstart) is in use, so callers need only one path.
 local function run_find_async(root, query, opts, on_done)
 	local cmd = {
 		opts.binary,
@@ -106,7 +100,7 @@ local function run_find_async(root, query, opts, on_done)
 	end
 
 	if vim.system then
-		return vim.system(cmd, { text = true }, function(out)
+		local handle = vim.system(cmd, { text = true }, function(out)
 			vim.schedule(function()
 				if out.code ~= 0 then
 					on_done(nil, out.stderr or "search failed")
@@ -122,6 +116,12 @@ local function run_find_async(root, query, opts, on_done)
 				on_done(decoded, nil)
 			end)
 		end)
+		-- Normalise: wrap the vim.system object so all callers use .stop().
+		return {
+			stop = function()
+				handle:kill(15)
+			end,
+		}
 	end
 
 	local stdout_chunks = {}
@@ -171,7 +171,7 @@ local function run_find_async(root, query, opts, on_done)
 	end
 
 	return {
-		kill = function()
+		stop = function()
 			vim.fn.jobstop(job_id)
 		end,
 	}
@@ -240,17 +240,16 @@ function M.find_files()
 	vim.bo[preview_buf].modifiable = false
 	vim.bo[preview_buf].bufhidden = "wipe"
 
-	local function close_all()
-		if state.active_job and state.active_job.kill then
-			pcall(function()
-				state.active_job:kill(15)
-			end)
-			pcall(function()
-				state.active_job.kill()
-			end)
+	--- Cancel any in-flight search job using the normalised stop() interface.
+	local function cancel_active_job()
+		if state.active_job then
+			pcall(state.active_job.stop)
 			state.active_job = nil
 		end
+	end
 
+	local function close_all()
+		cancel_active_job()
 		for _, win in ipairs({ prompt_win, results_win, preview_win, frame_win }) do
 			if vim.api.nvim_win_is_valid(win) then
 				vim.api.nvim_win_close(win, true)
@@ -286,7 +285,12 @@ function M.find_files()
 
 		close_all()
 		vim.cmd.edit(vim.fn.fnameescape(root .. "/" .. item.path))
-		run_system({ opts.binary, "touch", "--path", item.path })
+		-- Record the open asynchronously so it does not block the editor.
+		if vim.system then
+			vim.system({ opts.binary, "touch", "--path", item.path }, { text = true })
+		else
+			vim.fn.jobstart({ opts.binary, "touch", "--path", item.path })
+		end
 	end
 
 	local function move_cursor(delta)
@@ -304,15 +308,7 @@ function M.find_files()
 		state.last_request = state.last_request + 1
 		local request_id = state.last_request
 
-		if state.active_job and state.active_job.kill then
-			pcall(function()
-				state.active_job:kill(15)
-			end)
-			pcall(function()
-				state.active_job.kill()
-			end)
-			state.active_job = nil
-		end
+		cancel_active_job()
 
 		if query == "" then
 			state.items = {}
@@ -343,7 +339,7 @@ function M.find_files()
 				state.index = 1
 				render_results()
 			end)
-		end, 60)
+		end, opts.debounce_ms or 60)
 	end
 
 	vim.api.nvim_buf_attach(prompt_buf, false, {
@@ -378,7 +374,9 @@ function M.grep_cword()
 	M.live_grep_prefilled(word)
 end
 
-local function run_grep_with_query(query, opts, root)
+--- Run grep asynchronously and populate the quickfix list on completion.
+--- Uses vim.system (non-blocking) when available, falls back to jobstart.
+local function run_grep_async(query, opts, root)
 	local cmd = {
 		opts.binary,
 		"grep",
@@ -400,30 +398,82 @@ local function run_grep_with_query(query, opts, root)
 		table.insert(cmd, "--rebuild-cache")
 	end
 
-	local stdout, err = run_system(cmd)
-	if not stdout then
-		vim.notify("smart-fuzzy-finder: " .. (err or "grep failed"), vim.log.levels.ERROR)
+	local function handle_result(stdout, err)
+		if not stdout then
+			vim.notify("smart-fuzzy-finder: " .. (err or "grep failed"), vim.log.levels.ERROR)
+			return
+		end
+
+		local ok, matches = pcall(vim.json.decode, stdout)
+		if not ok then
+			vim.notify("smart-fuzzy-finder: failed to parse grep output", vim.log.levels.ERROR)
+			return
+		end
+
+		local qf = {}
+		for _, item in ipairs(matches) do
+			qf[#qf + 1] = {
+				filename = root .. "/" .. item.path,
+				lnum = item.line,
+				col = item.column,
+				text = item.text,
+			}
+		end
+
+		vim.fn.setqflist({}, " ", { title = "smart-fuzzy-finder grep: " .. query, items = qf })
+		vim.cmd.copen()
+	end
+
+	if vim.system then
+		vim.system(cmd, { text = true }, function(out)
+			vim.schedule(function()
+				if out.code ~= 0 then
+					handle_result(nil, out.stderr or "grep failed")
+				else
+					handle_result(out.stdout, nil)
+				end
+			end)
+		end)
 		return
 	end
 
-	local ok, matches = pcall(vim.json.decode, stdout)
-	if not ok then
-		vim.notify("smart-fuzzy-finder: failed to parse grep output", vim.log.levels.ERROR)
-		return
-	end
+	local stdout_chunks = {}
+	local stderr_chunks = {}
+	local job_id = vim.fn.jobstart(cmd, {
+		stdout_buffered = true,
+		stderr_buffered = true,
+		on_stdout = function(_, data)
+			if data then
+				for _, line in ipairs(data) do
+					if line ~= "" then
+						table.insert(stdout_chunks, line)
+					end
+				end
+			end
+		end,
+		on_stderr = function(_, data)
+			if data then
+				for _, line in ipairs(data) do
+					if line ~= "" then
+						table.insert(stderr_chunks, line)
+					end
+				end
+			end
+		end,
+		on_exit = function(_, code)
+			vim.schedule(function()
+				if code ~= 0 then
+					handle_result(nil, table.concat(stderr_chunks, "\n"))
+				else
+					handle_result(table.concat(stdout_chunks, "\n"), nil)
+				end
+			end)
+		end,
+	})
 
-	local qf = {}
-	for _, item in ipairs(matches) do
-		qf[#qf + 1] = {
-			filename = root .. "/" .. item.path,
-			lnum = item.line,
-			col = item.column,
-			text = item.text,
-		}
+	if job_id <= 0 then
+		vim.notify("smart-fuzzy-finder: failed to spawn grep process", vim.log.levels.ERROR)
 	end
-
-	vim.fn.setqflist({}, " ", { title = "smart-fuzzy-finder grep: " .. query, items = qf })
-	vim.cmd.copen()
 end
 
 function M.live_grep_prefilled(default_text)
@@ -435,7 +485,7 @@ function M.live_grep_prefilled(default_text)
 			return
 		end
 
-		run_grep_with_query(input, opts, root)
+		run_grep_async(input, opts, root)
 	end)
 end
 
